@@ -70,20 +70,58 @@ func (r *ThreatPolicyReconciler) Reconcile(ctx context.Context, request reconcil
 }
 
 func (r *ThreatPolicyReconciler) reconcileSpec(ctx context.Context, pol *v1alpha1.ThreatPolicy, kuadrantCtx types.KuadrantCtx) (*v1alpha1.ThreatPolicyStatus, error) {
-	r.Logger.Info("registering upstream", "url", threatServiceURL)
+	r.Logger.Info("registering action method", "url", threatServiceURL)
 
-	if err := kuadrantCtx.RegisterUpstreamMethod(ctx, pol, types.UpstreamConfig{
-		URL:     threatServiceURL,
-		Service: "threat.v1.ThreatAssessmentService",
-		Method:  "AssessRequest",
+	if err := kuadrantCtx.RegisterActionMethod(ctx, pol, types.ActionMethodConfig{
+		Name:            "assess-threat",
+		URL:             threatServiceURL,
+		Service:         "threat.v1.ThreatAssessmentService",
+		Method:          "AssessRequest",
+		MessageTemplate: `threat.v1.ThreatRequest{uri: request.path, source_ip: source.address}`,
 	}); err != nil {
-		r.Logger.Error(err, "failed to register upstream")
+		r.Logger.Error(err, "failed to register action method")
 		return calculateErrorStatus(pol, err), err
 	}
 
-	r.Logger.Info("upstream registered successfully", "url", threatServiceURL)
-	// TODO: Next step - call Extension SDK API to define the gRPC call and response handling
-	// Will use pol.Spec.Threshold to build the callback CEL expression
+	r.Logger.Info("action method registered successfully", "url", threatServiceURL)
+
+	pipeline := kuadrantCtx.NewPipeline(pol)
+
+	// Request phase: allow based on request path (evaluated first, no gRPC call if denied)
+	if err := pipeline.OnRequest(ctx, types.AllowAction{
+		Intention: `request.url_path != "/blocked"`,
+	}); err != nil {
+		r.Logger.Error(err, "failed to register OnRequest pipeline actions (allow)")
+		return calculateErrorStatus(pol, err), err
+	}
+
+	// Request phase: call the threat service and deny if threat_level >= threshold
+	// Only runs when the x-assess-threat header is present
+	if err := pipeline.OnRequest(ctx, types.GRPCMethodAction{
+		Predicate: []string{`"x-assess-threat" in request.headers`},
+		Method:    "assess-threat",
+		Var:       "threatResponse",
+		Intention: fmt.Sprintf("threatResponse.threat_level < %d", pol.Spec.Threshold),
+	}); err != nil {
+		r.Logger.Error(err, "failed to register OnRequest pipeline actions (grpc)")
+		return calculateErrorStatus(pol, err), err
+	}
+
+	// Response phase: add headers confirming the threat check ran and the threshold
+	// Headers must be a CEL list-of-lists: [["key", "value"], ...]
+	if err := pipeline.OnResponse(ctx,
+		types.AddHeadersAction{
+			HeadersToAdd: `[["x-threat-assessed", "true"]]`,
+		},
+		types.AddHeadersAction{
+			HeadersToAdd: fmt.Sprintf(`[["x-threat-threshold", "%d"]]`, pol.Spec.Threshold),
+		},
+	); err != nil {
+		r.Logger.Error(err, "failed to register OnResponse pipeline actions")
+		return calculateErrorStatus(pol, err), err
+	}
+
+	r.Logger.Info("pipeline actions registered successfully")
 	return calculateEnforcedStatus(pol, nil), nil
 }
 

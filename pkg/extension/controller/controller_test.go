@@ -30,10 +30,10 @@ import (
 )
 
 type mockKuadrantCtx struct {
-	resolveFn                func(ctx context.Context, policy exttypes.Policy, expression string, subscribe bool) (ref.Val, error)
-	resolvePolicyFn          func(ctx context.Context, policy exttypes.Policy, expression string, subscribe bool) (exttypes.Policy, error)
-	addDataToFn              func(ctx context.Context, policy exttypes.Policy, domain exttypes.Domain, binding string, expression string) error
-	registerUpstreamMethodFn func(ctx context.Context, policy exttypes.Policy, svc exttypes.UpstreamConfig) error
+	resolveFn              func(ctx context.Context, policy exttypes.Policy, expression string, subscribe bool) (ref.Val, error)
+	resolvePolicyFn        func(ctx context.Context, policy exttypes.Policy, expression string, subscribe bool) (exttypes.Policy, error)
+	addDataToFn            func(ctx context.Context, policy exttypes.Policy, domain exttypes.Domain, binding string, expression string) error
+	registerActionMethodFn func(ctx context.Context, policy exttypes.Policy, svc exttypes.ActionMethodConfig) error
 }
 
 type mockPolicy struct {
@@ -98,10 +98,14 @@ func (m *mockKuadrantCtx) ReconcileObject(ctx context.Context, obj, desired clie
 	return nil, nil
 }
 
-func (m *mockKuadrantCtx) RegisterUpstreamMethod(ctx context.Context, policy exttypes.Policy, svc exttypes.UpstreamConfig) error {
-	if m.registerUpstreamMethodFn != nil {
-		return m.registerUpstreamMethodFn(ctx, policy, svc)
+func (m *mockKuadrantCtx) RegisterActionMethod(ctx context.Context, policy exttypes.Policy, svc exttypes.ActionMethodConfig) error {
+	if m.registerActionMethodFn != nil {
+		return m.registerActionMethodFn(ctx, policy, svc)
 	}
+	return nil
+}
+
+func (m *mockKuadrantCtx) NewPipeline(policy exttypes.Policy) exttypes.Pipeline {
 	return nil
 }
 
@@ -295,7 +299,9 @@ func TestBuilderMissingSocketPath(t *testing.T) {
 
 // mockExtensionServiceClient implements extpb.ExtensionServiceClient for testing.
 type mockExtensionServiceClient struct {
-	registerUpstreamMethodFn func(ctx context.Context, in *extpb.RegisterUpstreamMethodRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	registerActionMethodFn func(ctx context.Context, in *extpb.RegisterActionMethodRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	pipelineOnRequestFn    func(ctx context.Context, in *extpb.PipelineOnRequestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	pipelineOnResponseFn   func(ctx context.Context, in *extpb.PipelineOnResponseRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 func (m *mockExtensionServiceClient) Ping(_ context.Context, _ *extpb.PingRequest, _ ...grpc.CallOption) (*extpb.PongResponse, error) {
@@ -313,8 +319,20 @@ func (m *mockExtensionServiceClient) RegisterMutator(_ context.Context, _ *extpb
 func (m *mockExtensionServiceClient) ClearPolicy(_ context.Context, _ *extpb.ClearPolicyRequest, _ ...grpc.CallOption) (*extpb.ClearPolicyResponse, error) {
 	return nil, nil
 }
-func (m *mockExtensionServiceClient) RegisterUpstreamMethod(ctx context.Context, in *extpb.RegisterUpstreamMethodRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	return m.registerUpstreamMethodFn(ctx, in, opts...)
+func (m *mockExtensionServiceClient) RegisterActionMethod(ctx context.Context, in *extpb.RegisterActionMethodRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	return m.registerActionMethodFn(ctx, in, opts...)
+}
+func (m *mockExtensionServiceClient) PipelineOnRequest(ctx context.Context, in *extpb.PipelineOnRequestRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	if m.pipelineOnRequestFn != nil {
+		return m.pipelineOnRequestFn(ctx, in, opts...)
+	}
+	return &emptypb.Empty{}, nil
+}
+func (m *mockExtensionServiceClient) PipelineOnResponse(ctx context.Context, in *extpb.PipelineOnResponseRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	if m.pipelineOnResponseFn != nil {
+		return m.pipelineOnResponseFn(ctx, in, opts...)
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func newTestExtensionController(mockClient *mockExtensionServiceClient) *ExtensionController {
@@ -325,10 +343,10 @@ func newTestExtensionController(mockClient *mockExtensionServiceClient) *Extensi
 	}
 }
 
-func TestRegisterUpstreamMethod_Success(t *testing.T) {
-	var capturedReq *extpb.RegisterUpstreamMethodRequest
+func TestRegisterActionMethod_Success(t *testing.T) {
+	var capturedReq *extpb.RegisterActionMethodRequest
 	mock := &mockExtensionServiceClient{
-		registerUpstreamMethodFn: func(_ context.Context, in *extpb.RegisterUpstreamMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+		registerActionMethodFn: func(_ context.Context, in *extpb.RegisterActionMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 			capturedReq = in
 			return &emptypb.Empty{}, nil
 		},
@@ -336,54 +354,178 @@ func TestRegisterUpstreamMethod_Success(t *testing.T) {
 
 	ec := newTestExtensionController(mock)
 	policy := &mockPolicy{name: "my-policy", namespace: "default"}
-	svc := exttypes.UpstreamConfig{
-		URL:     "grpc://my-service:8081",
-		Service: "my.Service",
-		Method:  "DoSomething",
+	svc := exttypes.ActionMethodConfig{
+		Name:            "assess-threat",
+		URL:             "grpc://my-service:8081",
+		Service:         "my.Service",
+		Method:          "DoSomething",
+		MessageTemplate: `ThreatRequest { uri: request.path }`,
 	}
 
-	err := ec.RegisterUpstreamMethod(context.Background(), policy, svc)
+	err := ec.RegisterActionMethod(context.Background(), policy, svc)
 	assert.NilError(t, err)
+	assert.Equal(t, capturedReq.Name, "assess-threat")
 	assert.Equal(t, capturedReq.Url, "grpc://my-service:8081")
 	assert.Equal(t, capturedReq.Service, "my.Service")
 	assert.Equal(t, capturedReq.Method, "DoSomething")
+	assert.Equal(t, capturedReq.MessageTemplate, `ThreatRequest { uri: request.path }`)
 	assert.Equal(t, capturedReq.Policy.Metadata.Name, "my-policy")
 	assert.Equal(t, capturedReq.Policy.Metadata.Namespace, "default")
 }
 
-func TestRegisterUpstreamMethod_Unavailable(t *testing.T) {
+func TestRegisterActionMethod_Unavailable(t *testing.T) {
 	mock := &mockExtensionServiceClient{
-		registerUpstreamMethodFn: func(_ context.Context, _ *extpb.RegisterUpstreamMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+		registerActionMethodFn: func(_ context.Context, _ *extpb.RegisterActionMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 			return nil, status.Error(codes.Unavailable, "connection refused to grpc://my-service:8081")
 		},
 	}
 
 	ec := newTestExtensionController(mock)
 	policy := &mockPolicy{name: "my-policy", namespace: "default"}
-	svc := exttypes.UpstreamConfig{URL: "grpc://my-service:8081"}
+	svc := exttypes.ActionMethodConfig{URL: "grpc://my-service:8081"}
 
-	err := ec.RegisterUpstreamMethod(context.Background(), policy, svc)
+	err := ec.RegisterActionMethod(context.Background(), policy, svc)
 	assert.Assert(t, err != nil)
 	assert.Assert(t, errors.Is(err, exttypes.ErrUpstreamUnreachable))
 	assert.Assert(t, cmp.Contains(err.Error(), "connection refused"))
 }
 
-func TestRegisterUpstreamMethod_OtherGRPCError(t *testing.T) {
+func TestRegisterActionMethod_OtherGRPCError(t *testing.T) {
 	mock := &mockExtensionServiceClient{
-		registerUpstreamMethodFn: func(_ context.Context, _ *extpb.RegisterUpstreamMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+		registerActionMethodFn: func(_ context.Context, _ *extpb.RegisterActionMethodRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 			return nil, status.Error(codes.InvalidArgument, "bad request")
 		},
 	}
 
 	ec := newTestExtensionController(mock)
 	policy := &mockPolicy{name: "my-policy", namespace: "default"}
-	svc := exttypes.UpstreamConfig{URL: "grpc://my-service:8081"}
+	svc := exttypes.ActionMethodConfig{URL: "grpc://my-service:8081"}
 
-	err := ec.RegisterUpstreamMethod(context.Background(), policy, svc)
+	err := ec.RegisterActionMethod(context.Background(), policy, svc)
 	assert.Assert(t, err != nil)
 	assert.Assert(t, !errors.Is(err, exttypes.ErrUpstreamUnreachable))
 	// Should be the original gRPC error, not wrapped as ErrUpstreamUnreachable
 	st, ok := status.FromError(err)
 	assert.Assert(t, ok)
 	assert.Equal(t, st.Code(), codes.InvalidArgument)
+}
+
+func TestNewPipeline_ReturnsNonNil(t *testing.T) {
+	mock := &mockExtensionServiceClient{}
+	ec := newTestExtensionController(mock)
+	policy := &mockPolicy{name: "my-policy", namespace: "default"}
+
+	pipeline := ec.NewPipeline(policy)
+	assert.Assert(t, pipeline != nil)
+}
+
+func TestPipelineOnRequest_ConvertsActions(t *testing.T) {
+	var capturedReq *extpb.PipelineOnRequestRequest
+	mock := &mockExtensionServiceClient{
+		pipelineOnRequestFn: func(_ context.Context, in *extpb.PipelineOnRequestRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+			capturedReq = in
+			return &emptypb.Empty{}, nil
+		},
+	}
+
+	ec := newTestExtensionController(mock)
+	policy := &mockPolicy{name: "my-policy", namespace: "default"}
+	pipeline := ec.NewPipeline(policy)
+
+	err := pipeline.OnRequest(context.Background(),
+		exttypes.GRPCMethodAction{
+			Predicate: []string{"true"},
+			Intention: "response.score > 5",
+			Method:    "assess-threat",
+		},
+		exttypes.AllowAction{
+			Predicate: []string{"request.path != '/health'"},
+			Intention: "request.auth.claims.role == 'admin'",
+		},
+	)
+	assert.NilError(t, err)
+	assert.Assert(t, capturedReq != nil)
+	assert.Equal(t, capturedReq.Policy.Metadata.Name, "my-policy")
+	assert.Equal(t, capturedReq.Policy.Metadata.Namespace, "default")
+	assert.Assert(t, cmp.Len(capturedReq.Actions, 2))
+
+	assert.Equal(t, capturedReq.Actions[0].ActionType, extpb.ActionType_ACTION_TYPE_GRPC_METHOD)
+	assert.Equal(t, capturedReq.Actions[0].Method, "assess-threat")
+	assert.Equal(t, capturedReq.Actions[0].Intention, "response.score > 5")
+	assert.Assert(t, cmp.Len(capturedReq.Actions[0].Predicates, 1))
+	assert.Equal(t, capturedReq.Actions[0].Predicates[0], "true")
+
+	assert.Equal(t, capturedReq.Actions[1].ActionType, extpb.ActionType_ACTION_TYPE_ALLOW)
+	assert.Equal(t, capturedReq.Actions[1].Intention, "request.auth.claims.role == 'admin'")
+}
+
+func TestPipelineOnResponse_ConvertsActions(t *testing.T) {
+	var capturedReq *extpb.PipelineOnResponseRequest
+	mock := &mockExtensionServiceClient{
+		pipelineOnResponseFn: func(_ context.Context, in *extpb.PipelineOnResponseRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+			capturedReq = in
+			return &emptypb.Empty{}, nil
+		},
+	}
+
+	ec := newTestExtensionController(mock)
+	policy := &mockPolicy{name: "my-policy", namespace: "default"}
+	pipeline := ec.NewPipeline(policy)
+
+	err := pipeline.OnResponse(context.Background(),
+		exttypes.AddHeadersAction{
+			Predicate:    []string{"true"},
+			HeadersToAdd: `{"x-threat-checked": "true"}`,
+		},
+		exttypes.WithResponseCodeAction{
+			Predicate:       []string{"response.score > 5"},
+			NewResponseCode: 403,
+		},
+	)
+	assert.NilError(t, err)
+	assert.Assert(t, capturedReq != nil)
+	assert.Equal(t, capturedReq.Policy.Metadata.Name, "my-policy")
+	assert.Assert(t, cmp.Len(capturedReq.Actions, 2))
+
+	assert.Equal(t, capturedReq.Actions[0].ActionType, extpb.ActionType_ACTION_TYPE_ADD_HEADERS)
+	assert.Equal(t, capturedReq.Actions[0].HeadersToAdd, `{"x-threat-checked": "true"}`)
+
+	assert.Equal(t, capturedReq.Actions[1].ActionType, extpb.ActionType_ACTION_TYPE_WITH_RESPONSE_CODE)
+	assert.Equal(t, capturedReq.Actions[1].NewResponseCode, int32(403))
+	assert.Assert(t, cmp.Len(capturedReq.Actions[1].Predicates, 1))
+	assert.Equal(t, capturedReq.Actions[1].Predicates[0], "response.score > 5")
+}
+
+func TestPipelineOnRequest_PropagatesError(t *testing.T) {
+	mock := &mockExtensionServiceClient{
+		pipelineOnRequestFn: func(_ context.Context, _ *extpb.PipelineOnRequestRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+			return nil, status.Error(codes.InvalidArgument, "bad action")
+		},
+	}
+
+	ec := newTestExtensionController(mock)
+	pipeline := ec.NewPipeline(&mockPolicy{name: "p", namespace: "ns"})
+
+	err := pipeline.OnRequest(context.Background(),
+		exttypes.AllowAction{},
+	)
+	assert.Assert(t, err != nil)
+	assert.Assert(t, cmp.Contains(err.Error(), "bad action"))
+}
+
+func TestPipelineOnResponse_PropagatesError(t *testing.T) {
+	mock := &mockExtensionServiceClient{
+		pipelineOnResponseFn: func(_ context.Context, _ *extpb.PipelineOnResponseRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+			return nil, status.Error(codes.InvalidArgument, "bad action")
+		},
+	}
+
+	ec := newTestExtensionController(mock)
+	pipeline := ec.NewPipeline(&mockPolicy{name: "p", namespace: "ns"})
+
+	err := pipeline.OnResponse(context.Background(),
+		exttypes.WithResponseCodeAction{NewResponseCode: 403},
+	)
+	assert.Assert(t, err != nil)
+	assert.Assert(t, cmp.Contains(err.Error(), "bad action"))
 }

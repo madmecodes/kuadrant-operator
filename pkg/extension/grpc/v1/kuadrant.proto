@@ -24,8 +24,12 @@ service ExtensionService {
   rpc RegisterMutator(RegisterMutatorRequest) returns (google.protobuf.Empty) {}
   // Clear all subscriptions and registered mutators for a policy
   rpc ClearPolicy(ClearPolicyRequest) returns (ClearPolicyResponse) {}
-  // Register an upstream gRPC service for a policy
-  rpc RegisterUpstreamMethod(RegisterUpstreamMethodRequest) returns (google.protobuf.Empty) {}
+  // Register a named gRPC action method for a policy
+  rpc RegisterActionMethod(RegisterActionMethodRequest) returns (google.protobuf.Empty) {}
+  // Register request-phase pipeline actions for a policy
+  rpc PipelineOnRequest(PipelineOnRequestRequest) returns (google.protobuf.Empty) {}
+  // Register response-phase pipeline actions for a policy
+  rpc PipelineOnResponse(PipelineOnResponseRequest) returns (google.protobuf.Empty) {}
 }
 
 // The request message containing the time the request was dispatched.
@@ -85,9 +89,56 @@ message ClearPolicyResponse {
   int32 cleared_mutators = 2;
 }
 
-message RegisterUpstreamMethodRequest {
+message RegisterActionMethodRequest {
   kuadrant.v1.Policy policy = 1;
   string url = 2;               // e.g. "grpc://my-service:8081"
-  string service = 3;           // gRPC service name (currently unused, reserved for future routing)
-  string method = 4;            // gRPC method name (currently unused, reserved for future routing)
+  string service = 3;           // gRPC service name
+  string method = 4;            // gRPC method name
+  string name = 5;              // Per-policy unique identifier for this action method
+  string message_template = 6;  // Opaque template string for building the gRPC request message
+}
+
+// ActionType discriminates how the wasm-shim dispatches an action.
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  ACTION_TYPE_GRPC_METHOD = 1;
+  ACTION_TYPE_ALLOW = 2;
+  ACTION_TYPE_ADD_HEADERS = 3;
+  ACTION_TYPE_WITH_RESPONSE_CODE = 4;
+}
+
+// RequestActionEntry represents a single action in the request phase.
+message RequestActionEntry {
+  ActionType action_type = 1;
+  repeated string predicates = 2;  // CEL predicates — if any is false, skip this action
+  string intention = 3;            // CEL expression evaluated against the gRPC response or request
+  string method = 4;               // Name of a registered ActionMethod (for grpc_method type)
+  string var = 5;                  // Variable name for the gRPC response (used by onReply predicates)
+}
+
+// ResponseActionEntry represents a single action in the response phase.
+message ResponseActionEntry {
+  ActionType action_type = 1;
+  repeated string predicates = 2;  // CEL predicates — if any is false, skip this action
+  string headers_to_add = 3;      // CEL expression evaluating to a map of headers (for add_headers type)
+  int32 new_response_code = 4;    // HTTP status code (for with_response_code type)
+}
+
+// PipelineOnRequestRequest registers request-phase actions for a policy.
+message PipelineOnRequestRequest {
+  kuadrant.v1.Policy policy = 1;
+  repeated RequestActionEntry actions = 2;
+  // When true, clear existing request-phase actions for this policy before
+  // appending. Used by PipelineImpl to ensure the first call in a reconcile
+  // replaces stale actions from prior reconciles.
+  bool reset = 3;
+}
+
+// PipelineOnResponseRequest registers response-phase actions for a policy.
+message PipelineOnResponseRequest {
+  kuadrant.v1.Policy policy = 1;
+  repeated ResponseActionEntry actions = 2;
+  // When true, clear existing response-phase actions for this policy before
+  // appending.
+  bool reset = 3;
 }

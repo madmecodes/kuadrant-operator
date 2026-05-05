@@ -582,7 +582,7 @@ func generateClusterName(host string, port int) string {
 	return clusterName
 }
 
-func (s *extensionService) RegisterUpstreamMethod(ctx context.Context, request *extpb.RegisterUpstreamMethodRequest) (*emptypb.Empty, error) {
+func (s *extensionService) RegisterActionMethod(ctx context.Context, request *extpb.RegisterActionMethodRequest) (*emptypb.Empty, error) {
 	if request == nil {
 		return nil, errors.New("request cannot be nil")
 	}
@@ -594,6 +594,9 @@ func (s *extensionService) RegisterUpstreamMethod(ctx context.Context, request *
 	}
 	if request.Policy.Metadata.Kind == "" || request.Policy.Metadata.Namespace == "" || request.Policy.Metadata.Name == "" {
 		return nil, errors.New("policy kind, namespace, and name must be specified")
+	}
+	if strings.TrimSpace(request.Name) == "" {
+		return nil, errors.New("name must be specified")
 	}
 	if request.Url == "" {
 		return nil, errors.New("url must be specified")
@@ -631,20 +634,36 @@ func (s *extensionService) RegisterUpstreamMethod(ctx context.Context, request *
 
 	clusterName := generateClusterName(host, port)
 
-	// Fetch service descriptors via reflection and validate method exists
-	fds, err := s.reflectionFetcher(ctx, parsed.Host, request.Service, request.Method)
-	if err != nil {
-		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "failed to fetch and validate service %s method %s: %v", request.Service, request.Method, err)
-	}
-
 	policyID := ResourceID{
 		Kind:      request.Policy.Metadata.Kind,
 		Namespace: request.Policy.Metadata.Namespace,
 		Name:      request.Policy.Metadata.Name,
 	}
 
+	key := RegisteredUpstreamKey{
+		Policy:  policyID,
+		Name:    request.Name,
+		URL:     request.Url,
+		Service: request.Service,
+		Method:  request.Method,
+	}
+
+	// Fast-path rejection: avoid the expensive reflection call when the name is already taken
+	if s.registeredData.IsUpstreamNameTaken(key) {
+		return nil, grpcstatus.Errorf(codes.AlreadyExists, "action method name %q is already registered for policy %s/%s", request.Name, policyID.Namespace, policyID.Name)
+	}
+
+	// Fetch service descriptors via reflection and validate method exists
+	fds, err := s.reflectionFetcher(ctx, parsed.Host, request.Service, request.Method)
+	if err != nil {
+		return nil, grpcstatus.Errorf(codes.FailedPrecondition, "failed to fetch and validate service %s method %s: %v", request.Service, request.Method, err)
+	}
+
 	// Use the first target ref from the policy
 	pbTargetRef := request.Policy.TargetRefs[0]
+	if pbTargetRef == nil {
+		return nil, errors.New("first target reference in policy is nil")
+	}
 	targetRef := TargetRef{
 		Group:     pbTargetRef.Group,
 		Kind:      pbTargetRef.Kind,
@@ -652,27 +671,26 @@ func (s *extensionService) RegisterUpstreamMethod(ctx context.Context, request *
 		Namespace: pbTargetRef.Namespace,
 	}
 
-	key := RegisteredUpstreamKey{
-		Policy:  policyID,
-		URL:     request.Url,
-		Service: request.Service,
-		Method:  request.Method,
-	}
 	entry := RegisteredUpstreamEntry{
-		ClusterName: clusterName,
-		Host:        host,
-		Port:        port,
-		TargetRef:   targetRef,
-		Service:     request.Service,
-		Method:      request.Method,
-		FailureMode: string(wasm.FailureModeDeny),
-		Timeout:     "100ms",
+		ClusterName:     clusterName,
+		Host:            host,
+		Port:            port,
+		TargetRef:       targetRef,
+		Service:         request.Service,
+		Method:          request.Method,
+		FailureMode:     string(wasm.FailureModeDeny),
+		Timeout:         "100ms",
+		MessageTemplate: request.MessageTemplate,
 	}
 
-	s.registeredData.SetUpstream(key, entry, fds)
+	// Atomically check name uniqueness and store the upstream
+	if !s.registeredData.SetUpstreamIfNameAvailable(key, entry, fds) {
+		return nil, grpcstatus.Errorf(codes.AlreadyExists, "action method name %q is already registered for policy %s/%s", request.Name, policyID.Namespace, policyID.Name)
+	}
 
-	s.logger.Info("registered upstream",
+	s.logger.Info("registered action method",
 		"policy", fmt.Sprintf("%s/%s", policyID.Namespace, policyID.Name),
+		"name", request.Name,
 		"url", request.Url,
 		"service", request.Service,
 		"method", request.Method,
@@ -680,7 +698,206 @@ func (s *extensionService) RegisterUpstreamMethod(ctx context.Context, request *
 
 	// Trigger reconciliation
 	if s.changeNotifier != nil {
-		reason := fmt.Sprintf("upstream registered for policy %s/%s: %s", policyID.Namespace, policyID.Name, request.Url)
+		reason := fmt.Sprintf("action method %q registered for policy %s/%s: %s", request.Name, policyID.Namespace, policyID.Name, request.Url)
+		if err := s.changeNotifier(reason); err != nil {
+			s.logger.Error(err, "failed to trigger change notification", "reason", reason)
+		}
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// validatePolicyRequest validates the common policy fields required by pipeline handlers.
+func validatePolicyRequest(policy *extpb.Policy) (ResourceID, error) {
+	if policy == nil {
+		return ResourceID{}, errors.New("policy cannot be nil")
+	}
+	if policy.Metadata == nil {
+		return ResourceID{}, errors.New("policy metadata cannot be nil")
+	}
+	if policy.Metadata.Kind == "" || policy.Metadata.Namespace == "" || policy.Metadata.Name == "" {
+		return ResourceID{}, errors.New("policy kind, namespace, and name must be specified")
+	}
+	return ResourceID{
+		Kind:      policy.Metadata.Kind,
+		Namespace: policy.Metadata.Namespace,
+		Name:      policy.Metadata.Name,
+	}, nil
+}
+
+// validateCELExpression checks that expr is syntactically valid CEL.
+func validateCELExpression(expr string) error {
+	env, err := cel.NewEnv()
+	if err != nil {
+		return fmt.Errorf("failed to create CEL environment: %w", err)
+	}
+	_, issues := env.Parse(expr)
+	if issues.Err() != nil {
+		return fmt.Errorf("invalid CEL expression %q: %w", expr, issues.Err())
+	}
+	return nil
+}
+
+// validRequestActionTypes lists action types allowed in the request phase.
+var validRequestActionTypes = map[extpb.ActionType]bool{
+	extpb.ActionType_ACTION_TYPE_GRPC_METHOD: true,
+	extpb.ActionType_ACTION_TYPE_ALLOW:       true,
+}
+
+// validResponseActionTypes lists action types allowed in the response phase.
+var validResponseActionTypes = map[extpb.ActionType]bool{
+	extpb.ActionType_ACTION_TYPE_ADD_HEADERS:        true,
+	extpb.ActionType_ACTION_TYPE_WITH_RESPONSE_CODE: true,
+}
+
+func (s *extensionService) PipelineOnRequest(_ context.Context, request *extpb.PipelineOnRequestRequest) (*emptypb.Empty, error) {
+	if request == nil {
+		return nil, errors.New("request cannot be nil")
+	}
+
+	policyID, err := validatePolicyRequest(request.Policy)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(request.Actions) == 0 {
+		return nil, errors.New("at least one action must be provided")
+	}
+
+	// Validate all actions before storing any (atomic batch validation).
+	entries := make([]PipelineActionEntry, 0, len(request.Actions))
+	for i, action := range request.Actions {
+		if action.ActionType == extpb.ActionType_ACTION_TYPE_UNSPECIFIED {
+			return nil, fmt.Errorf("action[%d]: action_type must be specified", i)
+		}
+		if !validRequestActionTypes[action.ActionType] {
+			return nil, fmt.Errorf("action[%d]: action_type %s is not valid in the request phase", i, action.ActionType)
+		}
+
+		// Validate predicates are syntactically valid CEL.
+		for j, pred := range action.Predicates {
+			if err := validateCELExpression(pred); err != nil {
+				return nil, fmt.Errorf("action[%d].predicates[%d]: %w", i, j, err)
+			}
+		}
+
+		entry := PipelineActionEntry{
+			ActionType: action.ActionType,
+			Predicates: action.Predicates,
+			Intention:  action.Intention,
+			Method:     action.Method,
+			Var:        action.Var,
+		}
+
+		switch action.ActionType {
+		case extpb.ActionType_ACTION_TYPE_GRPC_METHOD:
+			if action.Method == "" {
+				return nil, fmt.Errorf("action[%d]: method must be specified for grpc_method actions", i)
+			}
+			if !s.registeredData.HasUpstreamName(policyID, action.Method) {
+				return nil, fmt.Errorf("action[%d]: method %q is not a registered action method for this policy", i, action.Method)
+			}
+			if action.Intention != "" {
+				if err := validateCELExpression(action.Intention); err != nil {
+					return nil, fmt.Errorf("action[%d].intention: %w", i, err)
+				}
+			}
+		case extpb.ActionType_ACTION_TYPE_ALLOW:
+			if action.Intention != "" {
+				if err := validateCELExpression(action.Intention); err != nil {
+					return nil, fmt.Errorf("action[%d].intention: %w", i, err)
+				}
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	if request.GetReset_() {
+		s.registeredData.ClearPipelinePhase(policyID, PipelinePhaseRequest)
+	}
+	s.registeredData.AppendPipelineActions(policyID, PipelinePhaseRequest, entries)
+
+	s.logger.Info("registered request pipeline actions",
+		"policy", fmt.Sprintf("%s/%s", policyID.Namespace, policyID.Name),
+		"count", len(entries))
+
+	if s.changeNotifier != nil {
+		reason := fmt.Sprintf("request pipeline registered for policy %s/%s (%d actions)", policyID.Namespace, policyID.Name, len(entries))
+		if err := s.changeNotifier(reason); err != nil {
+			s.logger.Error(err, "failed to trigger change notification", "reason", reason)
+		}
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+func (s *extensionService) PipelineOnResponse(_ context.Context, request *extpb.PipelineOnResponseRequest) (*emptypb.Empty, error) {
+	if request == nil {
+		return nil, errors.New("request cannot be nil")
+	}
+
+	policyID, err := validatePolicyRequest(request.Policy)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(request.Actions) == 0 {
+		return nil, errors.New("at least one action must be provided")
+	}
+
+	// Validate all actions before storing any (atomic batch validation).
+	entries := make([]PipelineActionEntry, 0, len(request.Actions))
+	for i, action := range request.Actions {
+		if action.ActionType == extpb.ActionType_ACTION_TYPE_UNSPECIFIED {
+			return nil, fmt.Errorf("action[%d]: action_type must be specified", i)
+		}
+		if !validResponseActionTypes[action.ActionType] {
+			return nil, fmt.Errorf("action[%d]: action_type %s is not valid in the response phase", i, action.ActionType)
+		}
+
+		// Validate predicates are syntactically valid CEL.
+		for j, pred := range action.Predicates {
+			if err := validateCELExpression(pred); err != nil {
+				return nil, fmt.Errorf("action[%d].predicates[%d]: %w", i, j, err)
+			}
+		}
+
+		entry := PipelineActionEntry{
+			ActionType: action.ActionType,
+			Predicates: action.Predicates,
+		}
+
+		switch action.ActionType {
+		case extpb.ActionType_ACTION_TYPE_ADD_HEADERS:
+			if action.HeadersToAdd == "" {
+				return nil, fmt.Errorf("action[%d]: headers_to_add must be specified for add_headers actions", i)
+			}
+			if err := validateCELExpression(action.HeadersToAdd); err != nil {
+				return nil, fmt.Errorf("action[%d].headers_to_add: %w", i, err)
+			}
+			entry.HeadersToAdd = action.HeadersToAdd
+		case extpb.ActionType_ACTION_TYPE_WITH_RESPONSE_CODE:
+			if action.NewResponseCode < 100 || action.NewResponseCode > 599 {
+				return nil, fmt.Errorf("action[%d]: new_response_code must be between 100 and 599, got %d", i, action.NewResponseCode)
+			}
+			entry.NewResponseCode = action.NewResponseCode
+		}
+
+		entries = append(entries, entry)
+	}
+
+	if request.GetReset_() {
+		s.registeredData.ClearPipelinePhase(policyID, PipelinePhaseResponse)
+	}
+	s.registeredData.AppendPipelineActions(policyID, PipelinePhaseResponse, entries)
+
+	s.logger.Info("registered response pipeline actions",
+		"policy", fmt.Sprintf("%s/%s", policyID.Namespace, policyID.Name),
+		"count", len(entries))
+
+	if s.changeNotifier != nil {
+		reason := fmt.Sprintf("response pipeline registered for policy %s/%s (%d actions)", policyID.Namespace, policyID.Name, len(entries))
 		if err := s.changeNotifier(reason); err != nil {
 			s.logger.Error(err, "failed to trigger change notification", "reason", reason)
 		}

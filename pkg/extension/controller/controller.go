@@ -309,18 +309,20 @@ func (ec *ExtensionController) ClearPolicy(ctx context.Context, namespace, name,
 	return err
 }
 
-// RegisterUpstreamMethod registers an external gRPC service with the operator
+// RegisterActionMethod registers an external gRPC service with the operator
 // so that it becomes available to the data plane. The operator performs a
 // reachability check and, if successful, creates the necessary Envoy cluster
 // and wasm service entries.
-func (ec *ExtensionController) RegisterUpstreamMethod(ctx context.Context, policy exttypes.Policy, svc exttypes.UpstreamConfig) error {
+func (ec *ExtensionController) RegisterActionMethod(ctx context.Context, policy exttypes.Policy, svc exttypes.ActionMethodConfig) error {
 	pbPolicy := convertPolicyToProtobuf(policy)
 
-	_, err := ec.extensionClient.client.RegisterUpstreamMethod(ctx, &extpb.RegisterUpstreamMethodRequest{
-		Policy:  pbPolicy,
-		Url:     svc.URL,
-		Service: svc.Service,
-		Method:  svc.Method,
+	_, err := ec.extensionClient.client.RegisterActionMethod(ctx, &extpb.RegisterActionMethodRequest{
+		Policy:          pbPolicy,
+		Name:            svc.Name,
+		Url:             svc.URL,
+		Service:         svc.Service,
+		Method:          svc.Method,
+		MessageTemplate: svc.MessageTemplate,
 	})
 	if err != nil {
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
@@ -329,6 +331,111 @@ func (ec *ExtensionController) RegisterUpstreamMethod(ctx context.Context, polic
 		return err
 	}
 	return nil
+}
+
+// NewPipeline creates a Pipeline bound to the given policy. No I/O is performed;
+// the returned Pipeline captures the policy and gRPC client for later
+// OnRequest/OnResponse calls.
+func (ec *ExtensionController) NewPipeline(policy exttypes.Policy) exttypes.Pipeline {
+	return &PipelineImpl{
+		policy:        policy,
+		client:        ec.extensionClient.client,
+		requestReset:  true,
+		responseReset: true,
+	}
+}
+
+// PipelineImpl implements Pipeline by converting SDK action types to protobuf
+// messages and sending them to the operator via gRPC. The first OnRequest and
+// OnResponse calls send reset=true to clear stale actions from prior reconciles;
+// subsequent calls append.
+type PipelineImpl struct {
+	policy        exttypes.Policy
+	client        extpb.ExtensionServiceClient
+	requestReset  bool
+	responseReset bool
+}
+
+func (p *PipelineImpl) OnRequest(ctx context.Context, actions ...exttypes.RequestAction) error {
+	pbActions := make([]*extpb.RequestActionEntry, 0, len(actions))
+	for _, action := range actions {
+		entry, err := convertRequestAction(action)
+		if err != nil {
+			return err
+		}
+		pbActions = append(pbActions, entry)
+	}
+
+	_, err := p.client.PipelineOnRequest(ctx, &extpb.PipelineOnRequestRequest{
+		Policy:  convertPolicyToProtobuf(p.policy),
+		Actions: pbActions,
+		Reset_:  p.requestReset,
+	})
+	if err == nil {
+		p.requestReset = false
+	}
+	return err
+}
+
+func (p *PipelineImpl) OnResponse(ctx context.Context, actions ...exttypes.ResponseAction) error {
+	pbActions := make([]*extpb.ResponseActionEntry, 0, len(actions))
+	for _, action := range actions {
+		entry, err := convertResponseAction(action)
+		if err != nil {
+			return err
+		}
+		pbActions = append(pbActions, entry)
+	}
+
+	_, err := p.client.PipelineOnResponse(ctx, &extpb.PipelineOnResponseRequest{
+		Policy:  convertPolicyToProtobuf(p.policy),
+		Actions: pbActions,
+		Reset_:  p.responseReset,
+	})
+	if err == nil {
+		p.responseReset = false
+	}
+	return err
+}
+
+func convertRequestAction(action exttypes.RequestAction) (*extpb.RequestActionEntry, error) {
+	switch a := action.(type) {
+	case exttypes.GRPCMethodAction:
+		return &extpb.RequestActionEntry{
+			ActionType: extpb.ActionType_ACTION_TYPE_GRPC_METHOD,
+			Predicates: a.Predicate,
+			Intention:  a.Intention,
+			Method:     a.Method,
+			Var:        a.Var,
+		}, nil
+	case exttypes.AllowAction:
+		return &extpb.RequestActionEntry{
+			ActionType: extpb.ActionType_ACTION_TYPE_ALLOW,
+			Predicates: a.Predicate,
+			Intention:  a.Intention,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown request action type: %T", action)
+	}
+}
+
+func convertResponseAction(action exttypes.ResponseAction) (*extpb.ResponseActionEntry, error) {
+	switch a := action.(type) {
+	case exttypes.AddHeadersAction:
+		return &extpb.ResponseActionEntry{
+			ActionType:   extpb.ActionType_ACTION_TYPE_ADD_HEADERS,
+			Predicates:   a.Predicate,
+			HeadersToAdd: a.HeadersToAdd,
+		}, nil
+	case exttypes.WithResponseCodeAction:
+		return &extpb.ResponseActionEntry{
+			ActionType:      extpb.ActionType_ACTION_TYPE_WITH_RESPONSE_CODE,
+			Predicates:      a.Predicate,
+			NewResponseCode: int32(a.NewResponseCode), // #nosec G115
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown response action type: %T", action)
+	}
 }
 
 // Manager returns the underlying controller-runtime Manager.
